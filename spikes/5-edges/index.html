@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R0-5 Packaging edges &amp; perspective</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icons/icon-192.png">
+<link rel="stylesheet" href="../../common/style.css">
+</head>
+<body>
+<main>
+  <a href="../../index.html">← All spikes</a>
+  <h1>Spike 5 — Packaging edges, corners &amp; straightening</h1>
+  <p class="muted">Uses OpenCV.js on the phone to find the box outline, lets you drag the corners, then straightens the image. The original photo is always kept untouched.</p>
+
+  <div class="card">
+    <h2>Engine</h2>
+    <button id="load">Load image engine (≈11 MB, first time only)</button>
+    <pre id="engineInfo">Not loaded.</pre>
+  </div>
+
+  <div class="card">
+    <h2>A. Live outline preview + auto-capture</h2>
+    <p class="muted">Point at a box on a plain, contrasting surface. Corners are drawn live. If the outline stays steady for 1 second it counts as "stable".</p>
+    <label><input id="auto" type="checkbox" checked> Auto-capture when stable</label>
+    <div class="row">
+      <button id="liveStart" disabled>Start live preview</button>
+      <button id="liveSnap" class="secondary" disabled>Capture now</button>
+      <button id="liveStop" class="secondary" disabled>Stop</button>
+    </div>
+    <div class="stage" id="liveStage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="liveOverlay" class="overlay"></canvas>
+    </div>
+    <pre id="liveInfo">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>B. From a photo</h2>
+    <div class="row">
+      <button id="cam" disabled>Take photo</button>
+      <button id="gal" class="secondary" disabled>Choose photo</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>C. Adjust corners</h2>
+    <p class="muted">Drag the four round handles onto the box corners. Then tap Straighten.</p>
+    <div class="stage" id="editStage">
+      <canvas id="editBase"></canvas>
+      <canvas id="editOverlay" class="overlay"></canvas>
+    </div>
+    <div class="row">
+      <button id="warp" disabled>Straighten</button>
+      <button id="rotL" class="secondary" disabled>Rotate ⟲</button>
+      <button id="rotR" class="secondary" disabled>Rotate ⟳</button>
+      <button id="redetect" class="secondary" disabled>Re-detect</button>
+    </div>
+    <pre id="editInfo">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>D. Result</h2>
+    <p class="muted">The straightened image (top) is a new copy. Original (below) is unchanged.</p>
+    <canvas id="out"></canvas>
+    <p class="muted">Original kept:</p>
+    <img id="orig" class="preview" alt="">
+  </div>
+
+  <div class="card" id="panel"></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script type="module">
+import { $, now, ms, fmtBytes, decodeImage, bitmapToCanvas, rotateCanvas, pickFile, startRearCamera, stopStream, registerServiceWorker } from '../../common/util.js';
+import { Report } from '../../common/report.js';
+
+registerServiceWorker();
+const report = new Report('spike-5-edges', 'Packaging edges, corners and perspective', [
+  { id: 'detect', label: 'Box outline is found automatically on most boxes', how: 'Section B on 5 boxes: corners land roughly on the box without dragging, at least 3 of 5.' },
+  { id: 'adjust', label: 'Corner dragging is precise enough with a finger', how: 'Section C: you can place each corner accurately.' },
+  { id: 'warp', label: 'Straightened image looks correct', how: 'Section D: box face is flat and rectangular, text readable, not stretched.' },
+  { id: 'original', label: 'Original photo is preserved', how: 'Section D: the original photo below is unchanged.' },
+  { id: 'live', label: 'Live corner preview is smooth enough to use', how: 'Section A: outline follows the box, not jumpy.' },
+  { id: 'autocap', label: 'Auto-capture triggers when steady (stretch goal)', how: 'Section A: captures by itself when held still.' },
+]);
+report.renderPanel($('#panel'));
+
+let cv = null;
+$('#load').onclick = async () => {
+  const t0 = now();
+  $('#engineInfo').textContent = 'Downloading and starting…';
+  try {
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = '../../vendor/opencv/opencv.js'; s.async = true;
+      s.onload = resolve; s.onerror = () => reject(new Error('opencv.js failed to load'));
+      document.head.append(s);
+    });
+    let m = window.cv;
+    if (m instanceof Promise) m = await m;
+    else if (!m.Mat) await new Promise(r => { m.onRuntimeInitialized = r; });
+    cv = m;
+    const loadMs = ms(t0);
+    $('#engineInfo').textContent = `Ready in ${loadMs} ms`;
+    report.push('engineLoads', { loadMs });
+    report.log(`OpenCV ready in ${loadMs} ms`);
+    for (const id of ['liveStart', 'cam', 'gal']) $('#' + id).disabled = false;
+  } catch (e) {
+    $('#engineInfo').textContent = `FAILED: ${e.message}`;
+    report.log(`OpenCV failed: ${e.message}`);
+  }
+};
+
+// ---------- detection ----------
+function orderCorners(pts) {
+  // Returns [TL, TR, BR, BL]
+  const bySum = [...pts].sort((a, b) => (a.x + a.y) - (b.x + b.y));
+  const byDiff = [...pts].sort((a, b) => (a.y - a.x) - (b.y - b.x));
+  return [bySum[0], byDiff[0], bySum[3], byDiff[3]];
+}
+
+function detectQuad(canvas) {
+  const mats = [];
+  const keep = (m) => (mats.push(m), m);
+  try {
+    const src = keep(cv.imread(canvas));
+    const gray = keep(new cv.Mat()); cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    const blur = keep(new cv.Mat()); cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+    const edges = keep(new cv.Mat()); cv.Canny(blur, edges, 50, 150);
+    const kernel = keep(cv.Mat.ones(3, 3, cv.CV_8U));
+    cv.dilate(edges, edges, kernel);
+    const contours = keep(new cv.MatVector());
+    const hierarchy = keep(new cv.Mat());
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    const minArea = canvas.width * canvas.height * 0.10;
+    let best = null, bestArea = 0, largest = null, largestArea = 0;
+    for (let i = 0; i < contours.size(); i++) {
+      const c = contours.get(i);
+      const area = cv.contourArea(c);
+      if (area > largestArea) { if (largest) largest.delete(); largest = c; largestArea = area; } else c.delete();
+      if (area < minArea) continue;
+      const approx = new cv.Mat();
+      const cc = contours.get(i);
+      cv.approxPolyDP(cc, approx, 0.02 * cv.arcLength(cc, true), true);
+      if (approx.rows === 4 && cv.isContourConvex(approx) && area > bestArea) {
+        bestArea = area;
+        best = [];
+        for (let j = 0; j < 4; j++) best.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
+      }
+      approx.delete(); cc.delete();
+    }
+    if (best) { if (largest) largest.delete(); return { corners: orderCorners(best), method: 'quad', areaPct: Math.round(100 * bestArea / (canvas.width * canvas.height)) }; }
+    if (largest && largestArea >= minArea) {
+      const r = cv.boundingRect(largest); largest.delete();
+      return { corners: [{ x: r.x, y: r.y }, { x: r.x + r.width, y: r.y }, { x: r.x + r.width, y: r.y + r.height }, { x: r.x, y: r.y + r.height }], method: 'bounding-box', areaPct: Math.round(100 * largestArea / (canvas.width * canvas.height)) };
+    }
+    if (largest) largest.delete();
+    const w = canvas.width, h = canvas.height;
+    return { corners: [{ x: w * .1, y: h * .1 }, { x: w * .9, y: h * .1 }, { x: w * .9, y: h * .9 }, { x: w * .1, y: h * .9 }], method: 'none-found', areaPct: 0 };
+  } finally { mats.forEach(m => m.delete()); }
+}
+
+// ---------- live preview ----------
+let stream = null, liveTimer = null, stableSince = null, lastNorm = null, liveStats = null;
+const small = document.createElement('canvas');
+
+function drawOverlay(overlay, corners, w, h, color, handles = false) {
+  overlay.width = w; overlay.height = h;
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  if (!corners) return;
+  ctx.lineWidth = Math.max(3, w / 200); ctx.strokeStyle = color; ctx.fillStyle = color;
+  ctx.beginPath(); corners.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y))); ctx.closePath(); ctx.stroke();
+  const r = handles ? Math.max(18, w / 28) : Math.max(5, w / 90);
+  corners.forEach(p => { ctx.globalAlpha = handles ? 0.55 : 1; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill(); });
+  ctx.globalAlpha = 1;
+}
+
+$('#liveStart').onclick = async () => {
+  try { stream = await startRearCamera($('#video'), { width: 1920, height: 1080 }); }
+  catch (e) { $('#liveInfo').textContent = `Camera failed: ${e.message}`; return; }
+  $('#liveStart').disabled = true; $('#liveStop').disabled = $('#liveSnap').disabled = false;
+  liveStats = { frames: 0, totalMs: 0, startedAt: now(), stableEvents: 0, quadFrames: 0 };
+  const v = $('#video');
+  const tick = () => {
+    if (!stream) return;
+    if (v.videoWidth) {
+      const scale = 480 / v.videoWidth;
+      small.width = 480; small.height = Math.round(v.videoHeight * scale);
+      small.getContext('2d').drawImage(v, 0, 0, small.width, small.height);
+      const t0 = now();
+      const d = detectQuad(small);
+      const dt = ms(t0);
+      liveStats.frames++; liveStats.totalMs += dt; if (d.method === 'quad') liveStats.quadFrames++;
+      const ov = $('#liveOverlay');
+      ov.style.width = v.clientWidth + 'px'; ov.style.height = v.clientHeight + 'px';
+      const found = d.method === 'quad';
+      const normC = found ? d.corners.map(p => ({ x: p.x / small.width, y: p.y / small.height })) : null;
+      let moved = 1;
+      if (normC && lastNorm) moved = Math.max(...normC.map((p, i) => Math.hypot(p.x - lastNorm[i].x, p.y - lastNorm[i].y)));
+      lastNorm = normC;
+      if (found && moved < 0.02) { stableSince ??= now(); } else stableSince = null;
+      const stable = stableSince && now() - stableSince > 1000;
+      drawOverlay(ov, found ? d.corners : null, small.width, small.height, stable ? '#3B6D11' : '#EF9F27');
+      $('#liveInfo').textContent = `${found ? 'Box found' : 'Searching…'} · ${dt} ms/frame · avg ${Math.round(liveStats.totalMs / liveStats.frames)} ms · ${stable ? 'STABLE' : ''}`;
+      if (stable) {
+        liveStats.stableEvents++;
+        stableSince = null;
+        if ($('#auto').checked) { report.log('Auto-capture triggered'); captureLive('auto'); return; }
+      }
+    }
+    liveTimer = setTimeout(tick, 150);
+  };
+  tick();
+};
+
+function stopLive() {
+  clearTimeout(liveTimer); stopStream(stream); stream = null;
+  $('#liveStart').disabled = false; $('#liveStop').disabled = $('#liveSnap').disabled = true;
+  if (liveStats && liveStats.frames) {
+    const s = { frames: liveStats.frames, avgDetectMs: Math.round(liveStats.totalMs / liveStats.frames),
+      fps: +(liveStats.frames / ((now() - liveStats.startedAt) / 1000)).toFixed(1),
+      quadFoundPct: Math.round(100 * liveStats.quadFrames / liveStats.frames), stableEvents: liveStats.stableEvents };
+    report.push('liveSessions', s); report.log('Live session', s);
+  }
+  liveStats = null;
+}
+$('#liveStop').onclick = stopLive;
+
+async function captureLive(trigger) {
+  const v = $('#video');
+  let blob = null;
+  try { if ('ImageCapture' in window) blob = await new ImageCapture(stream.getVideoTracks()[0]).takePhoto(); } catch {}
+  if (!blob) {
+    const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext('2d').drawImage(v, 0, 0);
+    blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+  }
+  report.push('liveCaptures', { trigger, size: blob.size });
+  stopLive();
+  await loadPhoto(blob, `live-${trigger}`);
+}
+$('#liveSnap').onclick = () => captureLive('manual');
+
+// ---------- edit + warp ----------
+let original = null;       // full-res canvas (≤3000 px), never modified
+let working = null;        // rotated view of original
+let rotation = 0, corners = null, detection = null, dragged = false;
+
+async function loadPhoto(blob, source) {
+  const bmp = await decodeImage(blob);
+  original = bitmapToCanvas(bmp, 3000);
+  $('#orig').src = URL.createObjectURL(blob);
+  rotation = 0;
+  report.log(`Photo loaded (${source}) ${bmp.width}x${bmp.height}, ${fmtBytes(blob.size)}`);
+  prepareWorking(true, { source, resolution: `${bmp.width}x${bmp.height}` });
+}
+
+function prepareWorking(redetect, meta) {
+  working = rotateCanvas(original, rotation);
+  const base = $('#editBase');
+  base.width = working.width; base.height = working.height;
+  base.getContext('2d').drawImage(working, 0, 0);
+  if (redetect) {
+    const det = bitmapToCanvas(working, 1000);
+    const s = working.width / det.width;
+    const t0 = now();
+    detection = detectQuad(det);
+    detection.ms = ms(t0);
+    corners = detection.corners.map(p => ({ x: p.x * s, y: p.y * s }));
+    dragged = false;
+    $('#editInfo').textContent = `Detection: ${detection.method} in ${detection.ms} ms (${detection.areaPct}% of frame)`;
+    report.push('detections', { ...meta, method: detection.method, ms: detection.ms, areaPct: detection.areaPct, rotation });
+  }
+  redraw();
+  for (const id of ['warp', 'rotL', 'rotR', 'redetect']) $('#' + id).disabled = false;
+}
+
+function redraw() {
+  const ov = $('#editOverlay'), base = $('#editBase');
+  ov.style.width = base.clientWidth + 'px'; ov.style.height = base.clientHeight + 'px';
+  drawOverlay(ov, corners, base.width, base.height, '#185FA5', true);
+}
+window.addEventListener('resize', () => corners && redraw());
+
+// Pointer dragging of corner handles.
+let active = -1;
+const ov = $('#editOverlay');
+function toImg(e) {
+  const r = ov.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (ov.width / r.width), y: (e.clientY - r.top) * (ov.height / r.height) };
+}
+ov.addEventListener('pointerdown', (e) => {
+  if (!corners) return;
+  const p = toImg(e);
+  const hit = Math.max(40, ov.width / 12);
+  let bestD = Infinity;
+  corners.forEach((c, i) => { const d = Math.hypot(c.x - p.x, c.y - p.y); if (d < bestD) { bestD = d; active = i; } });
+  if (bestD > hit) { active = -1; return; }
+  ov.setPointerCapture(e.pointerId); e.preventDefault();
+});
+ov.addEventListener('pointermove', (e) => {
+  if (active < 0) return;
+  const p = toImg(e);
+  corners[active] = { x: Math.min(Math.max(0, p.x), ov.width), y: Math.min(Math.max(0, p.y), ov.height) };
+  dragged = true; redraw();
+});
+ov.addEventListener('pointerup', () => { active = -1; });
+ov.addEventListener('pointercancel', () => { active = -1; });
+
+$('#rotL').onclick = () => { rotation = (rotation + 3) % 4; prepareWorking(true, { source: 'rotate' }); };
+$('#rotR').onclick = () => { rotation = (rotation + 1) % 4; prepareWorking(true, { source: 'rotate' }); };
+$('#redetect').onclick = () => prepareWorking(true, { source: 'redetect' });
+
+$('#warp').onclick = () => {
+  const [tl, tr, br, bl] = corners;
+  const w = Math.round(Math.max(Math.hypot(tr.x - tl.x, tr.y - tl.y), Math.hypot(br.x - bl.x, br.y - bl.y)));
+  const h = Math.round(Math.max(Math.hypot(bl.x - tl.x, bl.y - tl.y), Math.hypot(br.x - tr.x, br.y - tr.y)));
+  const t0 = now();
+  const src = cv.imread(working);
+  const dst = new cv.Mat();
+  const from = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
+  const to = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, w, 0, w, h, 0, h]);
+  const M = cv.getPerspectiveTransform(from, to);
+  try {
+    cv.warpPerspective(src, dst, M, new cv.Size(w, h), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+    cv.imshow($('#out'), dst);
+    const r = { warpMs: ms(t0), output: `${w}x${h}`, cornersAdjustedByHand: dragged, detectionMethod: detection?.method, rotation: rotation * 90 };
+    $('#editInfo').textContent += `\nStraightened ${r.output} in ${r.warpMs} ms`;
+    report.push('warps', r); report.log('Warp', r);
+  } catch (e) { report.log(`Warp failed: ${e.message || e}`); }
+  finally { [src, dst, from, to, M].forEach(m => m.delete()); }
+};
+
+$('#cam').onclick = async () => { const [f] = await pickFile({ capture: true }); if (f) loadPhoto(f, 'camera'); };
+$('#gal').onclick = async () => { const [f] = await pickFile(); if (f) loadPhoto(f, 'gallery'); };
+</script>
+</body>
+</html>

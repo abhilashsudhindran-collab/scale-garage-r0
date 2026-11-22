@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scale Model Garage — R0 spikes</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<meta name="theme-color" content="#185fa5">
+<link rel="stylesheet" href="common/style.css">
+</head>
+<body>
+<main>
+  <h1>Scale Model Garage — R0 spikes</h1>
+  <p class="muted">Technical tests only — not the app. Each test runs on this phone and records its own results. Nothing is sent anywhere except your own Google Drive (Spikes 2 and 6, after you sign in).</p>
+
+  <div class="card">
+    <h2>Run in this order</h2>
+    <p><a class="btn" href="spikes/1-camera/index.html">1 · Camera</a></p>
+    <p><a class="btn" href="spikes/2-google/index.html">2 · Google sign-in, Sheets &amp; Drive</a></p>
+    <p><a class="btn" href="spikes/3-ocr/index.html">3 · OCR on 5 boxes</a></p>
+    <p><a class="btn" href="spikes/4-barcode/index.html">4 · Barcode</a></p>
+    <p><a class="btn" href="spikes/5-edges/index.html">5 · Box edges &amp; straightening</a></p>
+    <p><a class="btn" href="spikes/6-offline/index.html">6 · Offline capture &amp; sync</a></p>
+  </div>
+
+  <div class="card">
+    <h2>When you are done</h2>
+    <p><a class="btn secondary" href="results.html">Collect all results</a></p>
+    <p class="muted">One button copies every spike's results so you can paste them back to Claude.</p>
+  </div>
+
+  <div class="card">
+    <h2>This phone</h2>
+    <pre id="dev"></pre>
+  </div>
+</main>
+<script type="module">
+import { deviceInfo, registerServiceWorker, KIT_VERSION } from './common/util.js';
+registerServiceWorker();
+document.getElementById('dev').textContent = `Kit ${KIT_VERSION}\n` + JSON.stringify(deviceInfo(), null, 2);
+</script>
+</body>
+</html>

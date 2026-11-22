@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R0-4 Barcode</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icons/icon-192.png">
+<link rel="stylesheet" href="../../common/style.css">
+</head>
+<body>
+<main>
+  <a href="../../index.html">← All spikes</a>
+  <h1>Spike 4 — Barcode detection</h1>
+  <p class="muted">Compares Chrome's built-in barcode detector with the open-source ZXing fallback. Everything runs on the phone. Test on several boxes; type the digits printed under each barcode so results can be checked.</p>
+
+  <div class="card">
+    <h2>Engines available</h2>
+    <pre id="engines">Checking…</pre>
+    <label for="engine">Engine to use</label>
+    <select id="engine">
+      <option value="native">Chrome built-in</option>
+      <option value="zxing">ZXing (open-source fallback)</option>
+    </select>
+  </div>
+
+  <div class="card">
+    <h2>Expected value</h2>
+    <label for="truth">Digits printed under the barcode</label>
+    <input id="truth" type="text" inputmode="numeric" placeholder="e.g. 4897018671234">
+    <label for="truthCode">Product code on the same box (to confirm they are different)</label>
+    <input id="truthCode" type="text" placeholder="e.g. MGT00567">
+  </div>
+
+  <div class="card">
+    <h2>A. Live scan</h2>
+    <div class="row">
+      <button id="start">Start live scan</button>
+      <button id="stop" class="secondary" disabled>Stop</button>
+    </div>
+    <video id="video" autoplay playsinline muted></video>
+    <pre id="live">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>B. From a photo</h2>
+    <div class="row">
+      <button id="cam">Take photo &amp; scan</button>
+      <button id="gal" class="secondary">Choose photo &amp; scan</button>
+    </div>
+    <pre id="photo">—</pre>
+  </div>
+
+  <div class="card"><h2>Scans so far</h2><div id="summary">None yet.</div></div>
+  <div class="card" id="panel"></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script src="../../vendor/barcode/ponyfill.js"></script>
+<script type="module">
+import { $, el, now, ms, decodeImage, startRearCamera, stopStream, pickFile, registerServiceWorker } from '../../common/util.js';
+import { Report } from '../../common/report.js';
+
+registerServiceWorker();
+const report = new Report('spike-4-barcode', 'Barcode detection', [
+  { id: 'live', label: 'Live scan reads a real box barcode', how: 'Section A: correct digits appear within ~3 seconds.' },
+  { id: 'photo', label: 'Photo scan reads the barcode', how: 'Section B: correct digits from a still photo.' },
+  { id: 'accuracy', label: 'No wrong readings', how: 'Summary: every result matches the printed digits (MATCH).' },
+  { id: 'separate', label: 'Barcode is clearly different from the product code', how: 'Confirms barcode ≠ product code, so they must be stored separately.' },
+]);
+report.renderPanel($('#panel'));
+
+const FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'qr_code', 'data_matrix', 'itf'];
+const wasmUrl = new URL('../../vendor/barcode/zxing_reader.wasm', location.href).href;
+BarcodeDetectionAPI.prepareZXingModule({
+  overrides: { locateFile: (path, prefix) => (path.endsWith('.wasm') ? wasmUrl : prefix + path) },
+});
+
+const engines = {};
+async function initEngines() {
+  const info = {};
+  if ('BarcodeDetector' in window) {
+    try {
+      const fmts = await window.BarcodeDetector.getSupportedFormats();
+      info.native = { available: fmts.length > 0, formats: fmts };
+      if (fmts.length) engines.native = new window.BarcodeDetector({ formats: FORMATS.filter(f => fmts.includes(f)) });
+    } catch (e) { info.native = { available: false, error: e.message }; }
+  } else info.native = { available: false, reason: 'BarcodeDetector not in this browser' };
+  try {
+    const t0 = now();
+    const Z = BarcodeDetectionAPI.BarcodeDetector;
+    const zf = await Z.getSupportedFormats();
+    engines.zxing = new Z({ formats: FORMATS.filter(f => zf.includes(f)) });
+    info.zxing = { available: true, initMs: ms(t0) };
+  } catch (e) { info.zxing = { available: false, error: e.message }; }
+  $('#engines').textContent = JSON.stringify(info, null, 2);
+  if (!engines.native) $('#engine').value = 'zxing';
+  report.measure('engines', info);
+}
+await initEngines();
+
+function check(raw) {
+  const truth = $('#truth').value.trim();
+  const code = $('#truthCode').value.trim();
+  return {
+    match: truth ? raw === truth : null,
+    equalsProductCode: code ? raw.toUpperCase() === code.toUpperCase() : null,
+  };
+}
+
+function record(source, engine, r, elapsedMs) {
+  const c = check(r.rawValue);
+  const row = { source, engine, format: r.format, rawValue: r.rawValue, ms: elapsedMs, ...c, truthGiven: !!$('#truth').value.trim() };
+  report.push('scans', row);
+  report.log(`${source}/${engine}: ${r.format} ${r.rawValue} in ${elapsedMs} ms ${c.match === null ? '' : c.match ? 'MATCH' : 'MISMATCH'}`);
+  renderSummary();
+  return row;
+}
+
+let stream = null, running = false;
+$('#start').onclick = async () => {
+  const engineName = $('#engine').value;
+  const det = engines[engineName];
+  if (!det) { alert('That engine is not available on this phone.'); return; }
+  try { stream = await startRearCamera($('#video'), { width: 1920, height: 1080 }); }
+  catch (e) { $('#live').textContent = `Camera failed: ${e.message}`; return; }
+  $('#stop').disabled = false; $('#start').disabled = true;
+  running = true;
+  const t0 = now();
+  let frames = 0, busyMs = 0;
+  const loop = async () => {
+    if (!running) return;
+    const f0 = now();
+    try {
+      const found = await det.detect($('#video'));
+      frames++; busyMs += ms(f0);
+      if (found.length) {
+        const row = record('live', engineName, found[0], ms(t0));
+        $('#live').textContent = `${found[0].format}: ${found[0].rawValue}\nfirst read after ${row.ms} ms · ${frames} frames tried · avg ${Math.round(busyMs / frames)} ms per frame\n${row.match === null ? '' : row.match ? '✓ MATCH' : '✗ DIFFERENT from typed digits'}`;
+        stop();
+        return;
+      }
+      $('#live').textContent = `Scanning… ${frames} frames · avg ${Math.round(busyMs / frames)} ms per frame`;
+    } catch (e) { $('#live').textContent = `Error: ${e.message}`; }
+    setTimeout(loop, 120);
+  };
+  loop();
+};
+function stop() { running = false; stopStream(stream); stream = null; $('#stop').disabled = true; $('#start').disabled = false; }
+$('#stop').onclick = stop;
+
+async function photoScan(capture) {
+  const [file] = await pickFile({ capture });
+  if (!file) return;
+  const bmp = await decodeImage(file);
+  const lines = [];
+  for (const [name, det] of Object.entries(engines)) {
+    const t0 = now();
+    try {
+      const found = await det.detect(bmp);
+      const t = ms(t0);
+      if (found.length) { const row = record('photo', name, found[0], t); lines.push(`${name}: ${row.format} ${row.rawValue} (${t} ms) ${row.match === null ? '' : row.match ? '✓' : '✗'}`); }
+      else { lines.push(`${name}: nothing found (${t} ms)`); report.push('scans', { source: 'photo', engine: name, found: false, ms: t }); }
+    } catch (e) { lines.push(`${name}: error ${e.message}`); }
+  }
+  $('#photo').textContent = `Photo ${bmp.width}x${bmp.height}\n` + lines.join('\n');
+}
+$('#cam').onclick = () => photoScan(true);
+$('#gal').onclick = () => photoScan(false);
+
+function renderSummary() {
+  const s = (report.data.measurements.scans || []).filter(x => x.rawValue);
+  if (!s.length) return;
+  const t = el('table', {}, el('tr', {}, ...['Source', 'Engine', 'Value', 'Time', 'Check'].map(h => el('th', {}, h))));
+  s.forEach(x => t.append(el('tr', {}, el('td', {}, x.source), el('td', {}, x.engine), el('td', {}, `${x.rawValue} (${x.format})`),
+    el('td', {}, `${x.ms} ms`), el('td', { class: x.match ? 'ok' : x.match === false ? 'bad' : '' }, x.match === null ? '—' : x.match ? 'MATCH' : 'WRONG'))));
+  $('#summary').innerHTML = ''; $('#summary').append(t);
+}
+renderSummary();
+</script>
+</body>
+</html>

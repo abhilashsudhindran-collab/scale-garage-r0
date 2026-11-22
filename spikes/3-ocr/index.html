@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R0-3 OCR</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icons/icon-192.png">
+<link rel="stylesheet" href="../../common/style.css">
+</head>
+<body>
+<main>
+  <a href="../../index.html">← All spikes</a>
+  <h1>Spike 3 — OCR on real packaging</h1>
+  <p class="muted">Runs Tesseract.js entirely on the phone (no upload). Use <strong>five different real model boxes</strong>. For each one, type what is actually printed so the page can score the OCR honestly.</p>
+
+  <div class="card">
+    <h2>Engine</h2>
+    <label for="model">Text model</label>
+    <select id="model">
+      <option value="int">Compact (2.9 MB, faster)</option>
+      <option value="full">Full (11 MB, may be more accurate)</option>
+    </select>
+    <button id="load">Load OCR engine</button>
+    <pre id="engineInfo">Not loaded.</pre>
+  </div>
+
+  <div class="card">
+    <h2>Sample <span id="sampleNo">1</span></h2>
+    <label for="truthMaker">Miniature manufacturer printed on box</label>
+    <input id="truthMaker" type="text" placeholder="e.g. Mini GT">
+    <label for="truthCode">Product code printed on box (exactly)</label>
+    <input id="truthCode" type="text" placeholder="e.g. MGT00567" autocapitalize="characters">
+    <label for="truthScale">Scale printed on box</label>
+    <input id="truthScale" type="text" placeholder="e.g. 1:64">
+    <label for="truthKind">Which part did you photograph?</label>
+    <select id="truthKind">
+      <option>Box front</option><option>Box end/side label</option><option>Box back</option>
+      <option>Model underside</option><option>Sticker/label close-up</option>
+    </select>
+    <label for="prep">Image clean-up before OCR</label>
+    <select id="prep">
+      <option value="none">None (original photo)</option>
+      <option value="enhance" selected>Greyscale + contrast + resize</option>
+    </select>
+    <div class="row">
+      <button id="cam" disabled>Take photo &amp; read</button>
+      <button id="gal" class="secondary" disabled>Choose photo &amp; read</button>
+      <button id="rot" class="secondary" disabled>Rotate 90° &amp; re-read</button>
+    </div>
+    <canvas id="view"></canvas>
+    <div id="result"></div>
+  </div>
+
+  <div class="card">
+    <h2>Samples so far</h2>
+    <div id="summary">None yet.</div>
+  </div>
+
+  <div class="card" id="panel"></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script src="../../vendor/tesseract/tesseract.min.js"></script>
+<script type="module">
+import { $, el, now, ms, fmtBytes, decodeImage, bitmapToCanvas, rotateCanvas, pickFile, registerServiceWorker } from '../../common/util.js';
+import { Report } from '../../common/report.js';
+
+registerServiceWorker();
+const report = new Report('spike-3-ocr', 'OCR on packaging', [
+  { id: 'runs', label: 'OCR engine loads and runs on the phone', how: 'Engine loads; each read finishes without crashing the page.' },
+  { id: 'speed', label: 'Each read takes under 15 seconds', how: 'See "read time" for each sample.' },
+  { id: 'code', label: 'Product code found on at least 3 of 5 boxes', how: 'Summary table: "Code found" column.' },
+  { id: 'useful', label: 'Extracted text is useful as a starting suggestion', how: 'Your judgement: would editing this text be faster than typing from scratch?' },
+]);
+report.renderPanel($('#panel'));
+
+const base = new URL('../../vendor/tesseract/', location.href).href;
+let worker = null, currentCanvas = null, turns = 0;
+
+$('#load').onclick = async () => {
+  if (worker) { await worker.terminate(); worker = null; }
+  const model = $('#model').value;
+  const t0 = now();
+  $('#engineInfo').textContent = 'Loading…';
+  try {
+    worker = await Tesseract.createWorker('eng', 1, {
+      workerPath: base + 'worker.min.js',
+      corePath: base + 'core',
+      langPath: base + 'lang/' + model,
+      gzip: true,
+      logger: m => { if (m.status) $('#engineInfo').textContent = `${m.status} ${Math.round((m.progress || 0) * 100)}%`; },
+    });
+    const loadMs = ms(t0);
+    $('#engineInfo').textContent = `Ready (${model} model) in ${loadMs} ms`;
+    report.push('engineLoads', { model, loadMs, simd: typeof WebAssembly === 'object' });
+    report.log(`OCR engine (${model}) loaded in ${loadMs} ms`);
+    $('#cam').disabled = $('#gal').disabled = false;
+  } catch (e) {
+    $('#engineInfo').textContent = `FAILED: ${e.message || e}`;
+    report.log(`Engine load failed: ${e.message || e}`);
+  }
+};
+
+function enhance(src) {
+  // Upscale small images / downscale huge ones to ~2000 px wide, greyscale, stretch contrast.
+  const target = 2000;
+  const scale = target / Math.max(src.width, src.height);
+  const c = document.createElement('canvas');
+  c.width = Math.round(src.width * scale); c.height = Math.round(src.height * scale);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(src, 0, 0, c.width, c.height);
+  const img = ctx.getImageData(0, 0, c.width, c.height);
+  const d = img.data;
+  let lo = 255, hi = 0;
+  const g = new Uint8ClampedArray(d.length / 4);
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+    const v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    g[j] = v; if (v < lo) lo = v; if (v > hi) hi = v;
+  }
+  const range = Math.max(1, hi - lo);
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+    const v = ((g[j] - lo) * 255) / range;
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+const norm = (s) => (s || '').toUpperCase().replace(/\s+/g, '');
+// Smallest number of single-character edits needed to find `pat` anywhere inside `text`
+// (approximate substring match). Used ONLY to score OCR suggestions — never for duplicate detection.
+function fuzzyDistance(pat, text) {
+  if (!pat) return null;
+  let prev = new Array(text.length + 1).fill(0);
+  for (let i = 1; i <= pat.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= text.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (pat[i - 1] === text[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return Math.min(...prev);
+}
+function findCandidates(text) {
+  const scales = [...new Set((text.match(/1\s*[:/]\s*\d{1,3}/g) || []).map(s => s.replace(/\s/g, '')))];
+  const codes = [...new Set((text.match(/\b[A-Z]{0,5}[-\s]?\d{2,6}[A-Z0-9-]{0,6}\b/gi) || []).map(s => s.trim()))].slice(0, 12);
+  return { scales, codes };
+}
+
+async function readCanvas(source, origMeta) {
+  const prep = $('#prep').value;
+  const input = prep === 'enhance' ? enhance(source) : source;
+  const view = $('#view');
+  view.width = input.width; view.height = input.height;
+  view.getContext('2d').drawImage(input, 0, 0);
+  $('#result').textContent = 'Reading…';
+  const t0 = now();
+  const { data } = await worker.recognize(input);
+  const readMs = ms(t0);
+  const text = data.text || '';
+  const truth = { maker: $('#truthMaker').value.trim(), code: $('#truthCode').value.trim(), scale: $('#truthScale').value.trim(), kind: $('#truthKind').value };
+  const T = norm(text);
+  const found = {
+    code: truth.code ? T.includes(norm(truth.code)) : null,
+    maker: truth.maker ? T.includes(norm(truth.maker)) : null,
+    scale: truth.scale ? T.includes(norm(truth.scale)) || T.includes(norm(truth.scale).replace(':', '/')) : null,
+  };
+  found.codeEditDistance = truth.code ? fuzzyDistance(norm(truth.code), T) : null;
+  found.codeNear = found.codeEditDistance !== null ? found.codeEditDistance <= 1 : null;
+  const cands = findCandidates(text);
+  const res = {
+    sample: (report.data.measurements.samples || []).length + 1,
+    model: $('#model').value, prep, rotation: turns * 90, readMs,
+    confidence: Math.round(data.confidence ?? -1),
+    photo: origMeta, truth, found, candidates: cands,
+    text: text.slice(0, 1500),
+  };
+  report.push('samples', res);
+  report.log(`Sample ${res.sample}: ${readMs} ms, conf ${res.confidence}, code ${found.code}`);
+  const yes = (v) => v === null ? el('span', { class: 'muted' }, 'not given') : el('span', { class: `pill ${v ? 'ok' : 'bad'}` }, v ? 'found' : 'not found');
+  $('#result').innerHTML = '';
+  $('#result').append(
+    el('p', {}, `Read time ${readMs} ms · confidence ${res.confidence}`),
+    el('p', {}, 'Product code: ', yes(found.code), '  Maker: ', yes(found.maker), '  Scale: ', yes(found.scale)),
+    found.code === false && found.codeNear ? el('p', { class: 'warn' }, `Product code almost found — ${found.codeEditDistance} character wrong (e.g. O read as 0). Would need your correction.`) : '',
+    el('p', { class: 'muted' }, `Scale candidates: ${cands.scales.join(', ') || '—'}`),
+    el('p', { class: 'muted' }, `Code-like candidates: ${cands.codes.join(', ') || '—'}`),
+    el('pre', {}, text || '(no text found)'),
+  );
+  renderSummary();
+  $('#rot').disabled = false;
+}
+
+async function takeAndRead(capture) {
+  const [file] = await pickFile({ capture });
+  if (!file) return;
+  const bmp = await decodeImage(file);
+  turns = 0;
+  currentCanvas = bitmapToCanvas(bmp, 4000);
+  const meta = { resolution: `${bmp.width}x${bmp.height}`, size: fmtBytes(file.size) };
+  currentCanvas._meta = meta;
+  try { await readCanvas(currentCanvas, meta); }
+  catch (e) { $('#result').textContent = `FAILED: ${e.message || e}`; report.log(`OCR failed: ${e.message || e}`); }
+}
+$('#cam').onclick = () => takeAndRead(true);
+$('#gal').onclick = () => takeAndRead(false);
+$('#rot').onclick = async () => {
+  if (!currentCanvas) return;
+  turns = (turns + 1) % 4;
+  await readCanvas(rotateCanvas(currentCanvas, turns), currentCanvas._meta);
+};
+
+function renderSummary() {
+  const s = report.data.measurements.samples || [];
+  if (!s.length) return;
+  $('#sampleNo').textContent = String(new Set(s.map(x => x.truth.code + x.truth.maker)).size + 1);
+  const t = el('table', {}, el('tr', {}, ...['#', 'Box', 'Code', 'Code found', 'Time', 'Conf'].map(h => el('th', {}, h))));
+  s.forEach(x => t.append(el('tr', {},
+    el('td', {}, x.sample), el('td', {}, `${x.truth.maker || '?'} · ${x.truth.kind}`), el('td', {}, x.truth.code || '—'),
+    el('td', { class: x.found.code ? 'ok' : x.found.codeNear ? 'warn' : 'bad' },
+      x.found.code === null ? '—' : x.found.code ? 'exact' : x.found.codeNear ? '1 char off' : 'no'),
+    el('td', {}, `${(x.readMs / 1000).toFixed(1)} s`), el('td', {}, x.confidence))));
+  $('#summary').innerHTML = ''; $('#summary').append(t);
+}
+renderSummary();
+</script>
+</body>
+</html>

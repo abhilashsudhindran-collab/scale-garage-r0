@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R0 results</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="common/style.css">
+</head>
+<body>
+<main>
+  <a href="index.html">← All spikes</a>
+  <h1>All R0 results</h1>
+  <p class="muted">Everything recorded on this phone. The OAuth Client ID and Google tokens are <strong>not</strong> included.</p>
+  <div class="card" id="table"></div>
+  <div class="row">
+    <button id="copy">Copy all results</button>
+    <button id="dl" class="secondary">Download file</button>
+  </div>
+  <div class="card"><pre id="json"></pre></div>
+</main>
+<script type="module">
+import { el, deviceInfo, KIT_VERSION, registerServiceWorker } from './common/util.js';
+import { allReports, copyText, download } from './common/report.js';
+registerServiceWorker();
+const reports = allReports();
+const bundle = { kitVersion: KIT_VERSION, exportedAt: new Date().toISOString(), device: deviceInfo(), reports };
+const text = JSON.stringify(bundle, null, 2);
+document.getElementById('json').textContent = text;
+const t = el('table', {}, el('tr', {}, el('th', {}, 'Spike'), el('th', {}, 'Your verdicts')));
+if (!reports.length) t.append(el('tr', {}, el('td', { colspan: '2' }, 'No results yet.')));
+reports.forEach(r => {
+  const v = r.criteria.map(c => c.verdict === 'pass' ? '✓' : c.verdict === 'fail' ? '✗' : '·').join(' ');
+  t.append(el('tr', {}, el('td', {}, r.title), el('td', {}, v)));
+});
+document.getElementById('table').append(el('h2', {}, 'Summary'), t, el('p', { class: 'muted' }, '✓ pass · ✗ fail · not yet marked'));
+document.getElementById('copy').onclick = () => copyText(text);
+document.getElementById('dl').onclick = () => download('sgr0-results.json', text);
+</script>
+</body>
+</html>

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R0-1 Camera</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icons/icon-192.png">
+<link rel="stylesheet" href="../../common/style.css">
+</head>
+<body>
+<main>
+  <a href="../../index.html">← All spikes</a>
+  <h1>Spike 1 — Camera</h1>
+  <p class="muted">Tests whether the app, served from GitHub Pages, can use the phone's rear camera — in a normal Chrome tab and when installed to the home screen.</p>
+
+  <div class="card">
+    <h2>A. Live camera preview</h2>
+    <p class="muted">Tap Start. Allow camera access when Chrome asks.</p>
+    <div class="row">
+      <button id="start">Start camera</button>
+      <button id="snap" class="secondary" disabled>Capture frame</button>
+      <button id="torch" class="secondary" disabled>Torch</button>
+      <button id="stop" class="secondary" disabled>Stop</button>
+    </div>
+    <video id="video" autoplay playsinline muted></video>
+    <pre id="camInfo">Not started.</pre>
+    <img id="frame" class="preview" alt="">
+  </div>
+
+  <div class="card">
+    <h2>B. Full-resolution photo (phone camera app)</h2>
+    <p class="muted">Opens your phone's own camera app. Best photo quality; this is how originals would be captured.</p>
+    <button id="native">Take photo with camera app</button>
+    <pre id="nativeInfo">—</pre>
+    <img id="nativeImg" class="preview" alt="">
+  </div>
+
+  <div class="card">
+    <h2>C. Gallery import (several photos)</h2>
+    <button id="gallery">Choose photos from gallery</button>
+    <pre id="galleryInfo">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>D. Installed app check</h2>
+    <p>Mode right now: <strong id="mode"></strong></p>
+    <p class="muted">After finishing A–C in a Chrome tab: Chrome menu ⋮ → <em>Add to Home screen</em> (or <em>Install app</em>). Open it from the home-screen icon and repeat A.</p>
+  </div>
+
+  <div class="card" id="panel"></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script type="module">
+import { $, ms, now, fmtBytes, decodeImage, startRearCamera, stopStream, canvasToBlob, pickFile, registerServiceWorker } from '../../common/util.js';
+import { Report } from '../../common/report.js';
+
+registerServiceWorker();
+const standalone = matchMedia('(display-mode: standalone)').matches;
+$('#mode').textContent = standalone ? 'Installed app (standalone)' : 'Chrome tab';
+
+const report = new Report('spike-1-camera', 'Camera access', [
+  { id: 'live-tab', label: 'Live rear-camera preview works in a Chrome tab', how: 'Section A in a normal tab: preview appears, is the rear camera, and looks sharp.' },
+  { id: 'frame', label: 'Captured frame is usable', how: 'Section A: the captured frame is in focus and readable.' },
+  { id: 'native', label: 'Phone camera app photo returns to the page', how: 'Section B: photo appears below with full resolution.' },
+  { id: 'gallery', label: 'Multiple gallery photos can be imported', how: 'Section C: select 3+ photos; all are listed.' },
+  { id: 'live-installed', label: 'Live preview works in the installed home-screen app', how: 'Section D, then repeat A from the home-screen icon.' },
+  { id: 'permission-persist', label: 'Camera permission is remembered', how: 'Close and reopen the page: camera starts without asking again (or asks once only).' },
+]);
+report.renderPanel($('#panel'));
+
+let stream = null, torchOn = false;
+
+async function permissionState() {
+  try { return (await navigator.permissions.query({ name: 'camera' })).state; } catch { return 'unknown'; }
+}
+
+$('#start').onclick = async () => {
+  const before = await permissionState();
+  const t0 = now();
+  try {
+    stream = await startRearCamera($('#video'), { width: 3840, height: 2160 });
+    const track = stream.getVideoTracks()[0];
+    const settings = track.getSettings();
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    const info = {
+      mode: standalone ? 'standalone' : 'tab',
+      permissionBefore: before,
+      timeToFirstFrameMs: ms(t0),
+      label: track.label,
+      facingMode: settings.facingMode,
+      resolution: `${settings.width}x${settings.height}`,
+      frameRate: settings.frameRate,
+      focusModes: caps.focusMode || null,
+      torchSupported: !!caps.torch,
+      zoomRange: caps.zoom ? [caps.zoom.min, caps.zoom.max] : null,
+      maxResolution: caps.width ? `${caps.width.max}x${caps.height.max}` : null,
+      imageCaptureApi: 'ImageCapture' in window,
+    };
+    $('#camInfo').textContent = JSON.stringify(info, null, 2);
+    report.push('liveRuns', info);
+    report.log(`Camera started in ${info.timeToFirstFrameMs} ms at ${info.resolution}`);
+    $('#snap').disabled = $('#stop').disabled = false;
+    $('#torch').disabled = !info.torchSupported;
+  } catch (e) {
+    $('#camInfo').textContent = `FAILED: ${e.name}: ${e.message}`;
+    report.push('liveRuns', { mode: standalone ? 'standalone' : 'tab', permissionBefore: before, error: `${e.name}: ${e.message}` });
+    report.log(`Camera failed: ${e.name}: ${e.message}`);
+  }
+};
+
+$('#snap').onclick = async () => {
+  const v = $('#video');
+  const track = stream.getVideoTracks()[0];
+  let result;
+  if ('ImageCapture' in window) {
+    try {
+      const t0 = now();
+      const blob = await new ImageCapture(track).takePhoto();
+      const bmp = await decodeImage(blob);
+      result = { method: 'ImageCapture.takePhoto', ms: ms(t0), resolution: `${bmp.width}x${bmp.height}`, size: fmtBytes(blob.size) };
+      $('#frame').src = URL.createObjectURL(blob);
+    } catch (e) { result = { method: 'ImageCapture.takePhoto', error: e.message }; }
+  }
+  if (!result || result.error) {
+    const t0 = now();
+    const c = document.createElement('canvas');
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext('2d').drawImage(v, 0, 0);
+    const blob = await canvasToBlob(c, 'image/jpeg', 0.92);
+    result = { ...(result ? { imageCaptureError: result.error } : {}), method: 'video frame → canvas', ms: ms(t0), resolution: `${c.width}x${c.height}`, size: fmtBytes(blob.size) };
+    $('#frame').src = URL.createObjectURL(blob);
+  }
+  report.push('frames', result);
+  report.log(`Frame captured via ${result.method}: ${result.resolution}, ${result.size}`);
+};
+
+$('#torch').onclick = async () => {
+  try {
+    torchOn = !torchOn;
+    await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ torch: torchOn }] });
+    report.log(`Torch ${torchOn ? 'on' : 'off'}`);
+  } catch (e) { report.log(`Torch error: ${e.message}`); }
+};
+
+$('#stop').onclick = () => {
+  stopStream(stream); stream = null;
+  $('#snap').disabled = $('#stop').disabled = $('#torch').disabled = true;
+  report.log('Camera stopped');
+};
+
+$('#native').onclick = async () => {
+  const [file] = await pickFile({ capture: true });
+  if (!file) return;
+  const t0 = now();
+  const bmp = await decodeImage(file);
+  const info = { name: file.name, type: file.type, size: fmtBytes(file.size), resolution: `${bmp.width}x${bmp.height}`, decodeMs: ms(t0) };
+  $('#nativeInfo').textContent = JSON.stringify(info, null, 2);
+  $('#nativeImg').src = URL.createObjectURL(file);
+  report.push('nativePhotos', { ...info, name: undefined });
+  report.log(`Native camera photo ${info.resolution}, ${info.size}`);
+};
+
+$('#gallery').onclick = async () => {
+  const files = await pickFile({ multiple: true });
+  if (!files.length) return;
+  const rows = [];
+  for (const f of files) {
+    try { const b = await decodeImage(f); rows.push({ type: f.type, size: fmtBytes(f.size), resolution: `${b.width}x${b.height}` }); }
+    catch (e) { rows.push({ type: f.type, size: fmtBytes(f.size), error: e.message }); }
+  }
+  $('#galleryInfo').textContent = `${files.length} photo(s)\n` + rows.map((r, i) => `${i + 1}. ${r.resolution || r.error}  ${r.size}  ${r.type}`).join('\n');
+  report.push('galleryImports', { count: files.length, items: rows });
+  report.log(`Gallery import: ${files.length} photos`);
+};
+</script>
+</body>
+</html>
