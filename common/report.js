@@ -3,7 +3,9 @@
 // always set by the person running the test on the phone, never automatically.
 // Reports live only in this browser's localStorage until copied by the user.
 
-import { KIT_VERSION, deviceInfo, el, $ } from './util.js';
+import * as U from './util.js';
+const { KIT_VERSION, deviceInfo, el, $ } = U;
+const KIT_BUILD = U.KIT_BUILD ?? 'r0-1.0.0'; // tolerant if an older util.js is still cached
 
 const KEY = (id) => `sgr0.report.${id}`;
 
@@ -19,6 +21,7 @@ export class Report {
     };
     // Refresh device snapshot (standalone/online can change between runs).
     this.data.deviceLatest = deviceInfo();
+    this.data.kitBuild = KIT_BUILD;
     this.save();
   }
 
