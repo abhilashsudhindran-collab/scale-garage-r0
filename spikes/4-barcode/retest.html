@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R0-4b Barcode retest</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icons/icon-192.png">
+<link rel="stylesheet" href="../../common/style.css">
+</head>
+<body>
+<main>
+  <a href="../../index.html">← All spikes</a>
+  <h1>Spike 4b — Barcode retest (6+ boxes)</h1>
+  <p class="muted">Same barcode engines as Spike 4, but each box is recorded separately with its conditions. Do one box at a time: fill in step 1, run steps 2 and 3, then tap <strong>Save this box</strong>.</p>
+
+  <div class="card">
+    <h2>Engines on this phone</h2>
+    <pre id="engines">Checking…</pre>
+  </div>
+
+  <div class="card">
+    <h2>1. This box</h2>
+    <label for="boxName">Box name (brand + car)</label>
+    <input id="boxName" type="text" placeholder="e.g. Hot Wheels mainline — Nissan Skyline">
+    <label for="pack">Packaging</label>
+    <select id="pack">
+      <option value="">— choose —</option>
+      <option>Blister card (e.g. Hot Wheels)</option>
+      <option>Window box</option>
+      <option>Closed box</option>
+      <option>Other</option>
+    </select>
+    <p class="muted">Tick anything that makes this barcode harder:</p>
+    <label><input type="checkbox" class="cond" value="glossy"> Glossy / reflective</label>
+    <label><input type="checkbox" class="cond" value="curved"> Curved or bent</label>
+    <label><input type="checkbox" class="cond" value="small"> Small barcode</label>
+    <label><input type="checkbox" class="cond" value="damaged"> Scratched, torn or creased</label>
+    <label><input type="checkbox" class="cond" value="low-light"> Low light</label>
+    <label><input type="checkbox" class="cond" value="two-barcodes"> Box has more than one barcode</label>
+    <label for="truth">Digits printed under the barcode you are testing</label>
+    <input id="truth" type="text" inputmode="numeric" placeholder="e.g. 4895183683296">
+    <label for="truthCode">Product code on the same box</label>
+    <input id="truthCode" type="text" placeholder="e.g. HYW58">
+  </div>
+
+  <div class="card">
+    <h2>2. Live scan (Chrome built-in)</h2>
+    <div class="row">
+      <button id="start">Start live scan</button>
+      <button id="stop" class="secondary" disabled>Stop</button>
+    </div>
+    <video id="video" autoplay playsinline muted></video>
+    <pre id="live">—</pre>
+    <p class="muted">If nothing is found after 10 seconds, tap Stop — that counts as "not read live".</p>
+  </div>
+
+  <div class="card">
+    <h2>3. Photo scan (both engines)</h2>
+    <div class="row">
+      <button id="cam">Take photo &amp; scan</button>
+      <button id="gal" class="secondary">Choose photo &amp; scan</button>
+    </div>
+    <pre id="photo">—</pre>
+  </div>
+
+  <div class="card">
+    <button id="saveBox">Save this box &amp; start the next</button>
+    <pre id="saveInfo"></pre>
+  </div>
+
+  <div class="card"><h2>Boxes tested</h2><div id="boxes">None yet.</div><pre id="totals"></pre></div>
+  <div class="card" id="panel"></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script src="../../vendor/barcode/ponyfill.js"></script>
+<script type="module">
+import { $, el, now, ms, decodeImage, startRearCamera, stopStream, pickFile, registerServiceWorker } from '../../common/util.js';
+import { Report } from '../../common/report.js';
+
+registerServiceWorker();
+const report = new Report('spike-4b-barcode-retest', 'Barcode retest (6+ boxes)', [
+  { id: 'boxes', label: 'At least 6 boxes tested, including 2 Hot Wheels mainline cards', how: 'See "Boxes tested". Mix of packaging types and harder conditions.' },
+  { id: 'accuracy', label: 'No wrong values', how: 'Every value read matches the printed digits (0 WRONG in the totals).' },
+  { id: 'live', label: 'Live scan reads at least 90% of boxes within 3 seconds', how: 'Totals: "live within 3 s".' },
+  { id: 'zxing', label: 'ZXing fallback reads at least as many photos as Chrome built-in', how: 'Totals: photo reads per engine.' },
+  { id: 'shared', label: 'Hot Wheels shared-barcode question answered', how: 'Totals show whether two different boxes gave the same barcode. PASS = answered either way; note the answer.' },
+]);
+report.renderPanel($('#panel'));
+
+const FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'qr_code', 'data_matrix', 'itf'];
+const wasmUrl = new URL('../../vendor/barcode/zxing_reader.wasm', location.href).href;
+BarcodeDetectionAPI.prepareZXingModule({
+  overrides: { locateFile: (path, prefix) => (path.endsWith('.wasm') ? wasmUrl : prefix + path) },
+});
+const engines = {};
+{
+  const info = {};
+  if ('BarcodeDetector' in window) {
+    try {
+      const fmts = await window.BarcodeDetector.getSupportedFormats();
+      info.native = { available: fmts.length > 0, formats: fmts.length };
+      if (fmts.length) engines.native = new window.BarcodeDetector({ formats: FORMATS.filter(f => fmts.includes(f)) });
+    } catch (e) { info.native = { available: false, error: e.message }; }
+  } else info.native = { available: false };
+  try {
+    const Z = BarcodeDetectionAPI.BarcodeDetector;
+    const zf = await Z.getSupportedFormats();
+    engines.zxing = new Z({ formats: FORMATS.filter(f => zf.includes(f)) });
+    info.zxing = { available: true };
+  } catch (e) { info.zxing = { available: false, error: e.message }; }
+  $('#engines').textContent = JSON.stringify(info, null, 2);
+  report.measure('engines', info);
+}
+
+// The box currently being tested.
+let cur = newBox();
+function newBox() { return { live: null, photo: {} }; }
+const verdict = (raw) => { const t = $('#truth').value.trim(); return t ? (raw === t ? 'MATCH' : 'WRONG') : 'no digits typed'; };
+
+let stream = null, running = false;
+$('#start').onclick = async () => {
+  const det = engines.native || engines.zxing;
+  const engine = engines.native ? 'native' : 'zxing';
+  try { stream = await startRearCamera($('#video'), { width: 1920, height: 1080 }); }
+  catch (e) { $('#live').textContent = `Camera failed: ${e.message}`; return; }
+  $('#stop').disabled = false; $('#start').disabled = true; running = true;
+  const t0 = now(); let frames = 0;
+  const loop = async () => {
+    if (!running) return;
+    try {
+      const found = await det.detect($('#video')); frames++;
+      if (found.length) {
+        const r = found[0];
+        cur.live = { engine, value: r.rawValue, format: r.format, ms: ms(t0), frames, check: verdict(r.rawValue) };
+        $('#live').textContent = `${r.format}: ${r.rawValue}\nread after ${cur.live.ms} ms · ${cur.live.check}`;
+        stop(); return;
+      }
+      $('#live').textContent = `Scanning… ${Math.round(ms(t0) / 1000)} s · ${frames} frames`;
+    } catch (e) { $('#live').textContent = `Error: ${e.message}`; }
+    setTimeout(loop, 120);
+  };
+  loop();
+};
+function stop() {
+  if (running && !cur.live) cur.live = { engine: engines.native ? 'native' : 'zxing', value: null, ms: null, check: 'not read' };
+  running = false; stopStream(stream); stream = null; $('#stop').disabled = true; $('#start').disabled = false;
+}
+$('#stop').onclick = stop;
+
+async function photoScan(capture) {
+  const [file] = await pickFile({ capture });
+  if (!file) return;
+  const bmp = await decodeImage(file);
+  const lines = [`Photo ${bmp.width}x${bmp.height}`];
+  for (const [name, det] of Object.entries(engines)) {
+    const t0 = now();
+    try {
+      const found = await det.detect(bmp);
+      const t = ms(t0);
+      const all = found.map(f => f.rawValue);
+      cur.photo[name] = found.length ? { value: found[0].rawValue, format: found[0].format, allValues: all, ms: t, check: verdict(found[0].rawValue) }
+                                     : { value: null, ms: t, check: 'not read' };
+      lines.push(`${name}: ${found.length ? `${found[0].rawValue} (${t} ms) ${cur.photo[name].check}` : `nothing found (${t} ms)`}` +
+        (all.length > 1 ? `\n   also saw: ${all.slice(1).join(', ')}` : ''));
+    } catch (e) { cur.photo[name] = { value: null, error: e.message }; lines.push(`${name}: error ${e.message}`); }
+  }
+  $('#photo').textContent = lines.join('\n');
+}
+$('#cam').onclick = () => photoScan(true);
+$('#gal').onclick = () => photoScan(false);
+
+$('#saveBox').onclick = () => {
+  const name = $('#boxName').value.trim();
+  if (!name) { alert('Type the box name first (step 1).'); return; }
+  if (running) stop();
+  const box = {
+    n: (report.data.measurements.boxes || []).length + 1, name, packaging: $('#pack').value,
+    conditions: [...document.querySelectorAll('.cond:checked')].map(c => c.value),
+    printedDigits: $('#truth').value.trim() || null, productCode: $('#truthCode').value.trim() || null,
+    live: cur.live, photo: cur.photo, savedAt: new Date().toISOString(),
+  };
+  report.push('boxes', box);
+  report.log(`Saved box ${box.n}: ${name}`);
+  $('#saveInfo').textContent = `Saved box ${box.n}. Fill in the next box.`;
+  ['#boxName', '#truth', '#truthCode'].forEach(s => $(s).value = '');
+  document.querySelectorAll('.cond').forEach(c => c.checked = false);
+  $('#live').textContent = '—'; $('#photo').textContent = '—';
+  cur = newBox();
+  render();
+};
+
+function render() {
+  const boxes = report.data.measurements.boxes || [];
+  if (!boxes.length) return;
+  const t = el('table', {}, el('tr', {}, ...['#', 'Box', 'Live', 'Photo (built-in / ZXing)'].map(h => el('th', {}, h))));
+  boxes.forEach(b => t.append(el('tr', {},
+    el('td', {}, b.n), el('td', {}, `${b.name}${b.conditions.length ? ' · ' + b.conditions.join(', ') : ''}`),
+    el('td', { class: b.live?.check === 'MATCH' ? 'ok' : b.live?.check === 'WRONG' ? 'bad' : 'warn' }, b.live ? `${b.live.check}${b.live.ms ? ` ${(b.live.ms / 1000).toFixed(1)} s` : ''}` : 'not tried'),
+    el('td', {}, `${b.photo.native?.check ?? '—'} / ${b.photo.zxing?.check ?? '—'}`))));
+  $('#boxes').innerHTML = ''; $('#boxes').append(t);
+
+  const reads = boxes.flatMap(b => [b.live, b.photo.native, b.photo.zxing].filter(r => r && r.value));
+  const wrong = reads.filter(r => r.check === 'WRONG').length;
+  const liveFast = boxes.filter(b => b.live?.check === 'MATCH' && b.live.ms <= 3000).length;
+  const byValue = {};
+  boxes.forEach(b => { const v = b.printedDigits || b.live?.value || b.photo.native?.value || b.photo.zxing?.value; if (v) (byValue[v] ||= []).push(b.name); });
+  const shared = Object.entries(byValue).filter(([, names]) => names.length > 1).map(([v, names]) => ({ barcode: v, boxes: names }));
+  const totals = {
+    boxesTested: boxes.length,
+    hotWheelsBoxes: boxes.filter(b => /hot\s*wheels/i.test(b.name)).length,
+    valuesRead: reads.length, wrongValues: wrong,
+    liveWithin3s: `${liveFast} of ${boxes.length}`,
+    photoReads: { native: boxes.filter(b => b.photo.native?.value).length, zxing: boxes.filter(b => b.photo.zxing?.value).length },
+    sameBarcodeOnDifferentBoxes: shared.length ? shared : 'none so far',
+  };
+  report.measure('totals', totals);
+  $('#totals').textContent = JSON.stringify(totals, null, 2);
+}
+render();
+</script>
+</body>
+</html>
