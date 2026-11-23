@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R0-7 Photo import &amp; sizes</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icons/icon-192.png">
+<link rel="stylesheet" href="../../common/style.css">
+<style>
+  .thumbs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .thumbs figure { margin: 0; }
+  .thumbs img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 8px; }
+  .thumbs figcaption { font-size: 0.8rem; }
+  .thumbs select { font-size: 0.85rem; padding: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <a href="../../index.html">← All spikes</a>
+  <h1>Spike 7 — Photo import workflow &amp; real sizes</h1>
+  <p class="muted">Shows the planned way of adding photos (your phone's own camera app → back into the app), then <strong>measures</strong> the original and the smaller copies the app would make. Nothing leaves the phone unless you tap Upload in step 4.</p>
+
+  <div class="card">
+    <h2>1. Add photos</h2>
+    <p class="muted">Use real models and boxes. Aim for <strong>at least 5 camera photos</strong>: e.g. 3 of a model, 1 box front, 1 code label.</p>
+    <label for="role">This photo is a…</label>
+    <select id="role">
+      <option value="Model">Model photo (shared by all copies)</option>
+      <option value="Packaging">Box / packaging</option>
+      <option value="Label">Code label</option>
+      <option value="Underside">Underside</option>
+      <option value="Condition">Condition of one copy (copy-specific)</option>
+    </select>
+    <div class="row">
+      <button id="cam">Take photo (phone camera)</button>
+      <button id="gal" class="secondary">Import from gallery (several)</button>
+    </div>
+    <pre id="busy"></pre>
+  </div>
+
+  <div class="card">
+    <h2>2. Imported photos</h2>
+    <div id="thumbs" class="thumbs">None yet.</div>
+  </div>
+
+  <div class="card">
+    <h2>3. Measured sizes</h2>
+    <div id="table">—</div>
+    <pre id="avg">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>Storage calculator (uses the measured sizes)</h2>
+    <label for="pPhotos">Product photos per model (shared by all copies)</label>
+    <input id="pPhotos" type="number" value="5" min="1" max="8">
+    <label for="copies">Average copies owned per model</label>
+    <input id="copies" type="number" value="1.2" step="0.1" min="1">
+    <label for="cPhotos">Average condition photos per copy</label>
+    <input id="cPhotos" type="number" value="0.3" step="0.1" min="0" max="3">
+    <pre id="calc">Add photos first.</pre>
+  </div>
+
+  <div class="card">
+    <h2>4. Drive (optional)</h2>
+    <p class="muted">Uploads the original + display copy + thumbnail of each photo to a test folder <code>SGR0_IMAGES</code>, checks every file arrived intact, and reads your Drive storage figures.</p>
+    <div class="row">
+      <button id="signin">Sign in</button>
+      <button id="upload" disabled>Upload &amp; verify</button>
+      <button id="quota" class="secondary" disabled>Read Drive storage</button>
+    </div>
+    <pre id="driveInfo">—</pre>
+    <button id="cleanup" class="secondary" disabled>Clean up: move SGR0_IMAGES to trash</button>
+  </div>
+
+  <div class="card" id="panel"></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script type="module">
+import { $, el, now, ms, fmtBytes, decodeImage, bitmapToCanvas, canvasToBlob, pickFile, registerServiceWorker } from '../../common/util.js';
+import { Report } from '../../common/report.js';
+import { signIn, drive } from '../../common/google.js';
+import { md5Blob } from '../../common/md5.js';
+
+registerServiceWorker();
+const report = new Report('spike-7-images', 'Photo import workflow & real sizes', [
+  { id: 'capture', label: 'Phone camera opens from the app and the photo comes back', how: 'Step 1 "Take photo": your camera app opens; after the shot, the photo appears in step 2.' },
+  { id: 'gallery', label: 'Several gallery photos import, with thumbnails', how: 'Step 1 "Import from gallery": pick 3+; thumbnails show in step 2.' },
+  { id: 'sizes', label: 'Sizes measured on at least 5 real camera photos', how: 'Step 3 shows 5+ rows with source "camera".' },
+  { id: 'gps', label: 'Small copies carry no location data', how: 'Step 3: "Location in copies" says none for every photo (the original may have it).' },
+  { id: 'speed', label: 'Small copies made in under 2 seconds per photo', how: 'Step 3: "Make copies" time.' },
+  { id: 'upload', label: 'Upload to Drive arrives intact', how: 'Step 4: every file "checksum OK".' },
+  { id: 'quota', label: 'App can read Drive storage figures', how: 'Step 4 "Read Drive storage" shows used / total.' },
+]);
+report.renderPanel($('#panel'));
+
+// ---- EXIF reader: only checks WHETHER location data exists; it never reads coordinates. ----
+function exifInfo(buf) {
+  const v = new DataView(buf);
+  const out = { hasExif: false, orientation: null, gpsTagCount: 0 };
+  if (v.byteLength < 4 || v.getUint16(0) !== 0xFFD8) return out;
+  let p = 2;
+  while (p + 4 <= v.byteLength) {
+    const marker = v.getUint16(p); const len = v.getUint16(p + 2);
+    if (marker === 0xFFDA) break;
+    if (marker === 0xFFE1 && v.getUint32(p + 4) === 0x45786966) { // "Exif"
+      out.hasExif = true;
+      const t = p + 10; const le = v.getUint16(t) === 0x4949;
+      const u16 = (o) => v.getUint16(t + o, le), u32 = (o) => v.getUint32(t + o, le);
+      const ifd0 = u32(4); const n = u16(ifd0);
+      for (let i = 0; i < n; i++) {
+        const e = ifd0 + 2 + i * 12; const tag = u16(e);
+        if (tag === 0x0112) out.orientation = u16(e + 8);
+        if (tag === 0x8825) { const g = u32(e + 8); try { out.gpsTagCount = u16(g); } catch { out.gpsTagCount = -1; } }
+      }
+      break;
+    }
+    p += 2 + len;
+  }
+  return out;
+}
+
+const photos = [];   // in memory only
+let seq = 0;
+
+async function processFile(file, source) {
+  const role = $('#role').value;
+  $('#busy').textContent = `Processing ${file.name || 'photo'}…`;
+  const tDecode = now();
+  const bmp = await decodeImage(file);
+  const decodeMs = ms(tDecode);
+  const exif = exifInfo(await file.slice(0, 256 * 1024).arrayBuffer());
+  const t0 = now();
+  const mk = async (edge, type, q) => canvasToBlob(bitmapToCanvas(bmp, edge), type, q);
+  const display = await mk(1600, 'image/jpeg', 0.8);
+  const thumb = await mk(400, 'image/jpeg', 0.7);
+  const derivMs = ms(t0);
+  const corrected = await mk(2000, 'image/jpeg', 0.85);     // size proxy for a straightened box image
+  const displayWebp = await mk(1600, 'image/webp', 0.8);    // comparison only
+  const copyExif = [display, thumb, corrected].map(b => b);
+  const gpsInCopies = (await Promise.all(copyExif.map(async b => exifInfo(await b.arrayBuffer())))).some(x => x.gpsTagCount !== 0 || x.hasExif);
+  const rec = {
+    n: ++seq, source, role, type: file.type, width: bmp.width, height: bmp.height,
+    originalBytes: file.size, displayBytes: display.size, thumbBytes: thumb.size, correctedProxyBytes: corrected.size,
+    displayWebpBytes: displayWebp.type === 'image/webp' ? displayWebp.size : null,
+    originalHasExif: exif.hasExif, originalHasLocation: exif.gpsTagCount > 0, exifOrientation: exif.orientation,
+    locationInCopies: gpsInCopies, decodeMs, derivativesMs: derivMs,
+  };
+  bmp.close?.();
+  const md5 = await md5Blob(file);
+  photos.push({ ...rec, file, display, thumb, md5 });
+  report.push('photos', rec);
+  report.log(`#${rec.n} ${source}/${role}: original ${fmtBytes(rec.originalBytes)} ${rec.width}x${rec.height} → display ${fmtBytes(rec.displayBytes)}, thumb ${fmtBytes(rec.thumbBytes)} in ${derivMs} ms`);
+  $('#busy').textContent = '';
+  render();
+}
+
+$('#cam').onclick = async () => { const [f] = await pickFile({ capture: true }); if (f) await processFile(f, 'camera'); };
+$('#gal').onclick = async () => { const files = await pickFile({ multiple: true }); for (const f of files) await processFile(f, 'gallery'); };
+
+const avg = (xs) => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
+const MB = (b) => b / 1048576;
+
+function render() {
+  // Thumbnails (made from the thumbnail copy, as the real app would).
+  const grid = $('#thumbs'); grid.innerHTML = '';
+  photos.forEach(p => grid.append(el('figure', {},
+    el('img', { src: URL.createObjectURL(p.thumb), alt: `${p.role} photo ${p.n}` }),
+    el('figcaption', {}, `#${p.n} ${p.role} · ${p.source}`))));
+
+  const t = el('table', {}, el('tr', {}, ...['#', 'Original', 'Display', 'Thumb', 'Location', 'Make copies'].map(h => el('th', {}, h))));
+  photos.forEach(p => t.append(el('tr', {},
+    el('td', {}, `${p.n} ${p.source}`), el('td', {}, `${fmtBytes(p.originalBytes)} ${p.width}×${p.height}`),
+    el('td', {}, fmtBytes(p.displayBytes)), el('td', {}, fmtBytes(p.thumbBytes)),
+    el('td', { class: p.locationInCopies ? 'bad' : 'ok' }, `original: ${p.originalHasLocation ? 'YES' : 'no'} · copies: ${p.locationInCopies ? 'YES' : 'none'}`),
+    el('td', { class: p.derivativesMs <= 2000 ? 'ok' : 'warn' }, `${(p.derivativesMs / 1000).toFixed(2)} s`))));
+  $('#table').innerHTML = ''; $('#table').append(t);
+
+  const cam = photos.filter(p => p.source === 'camera');
+  const base = cam.length ? cam : photos;
+  const m = {
+    basedOn: `${base.length} ${cam.length ? 'camera' : 'gallery (no camera photos yet)'} photos`,
+    originalAvgMB: +MB(avg(base.map(p => p.originalBytes))).toFixed(2),
+    originalRangeMB: [+MB(Math.min(...base.map(p => p.originalBytes))).toFixed(2), +MB(Math.max(...base.map(p => p.originalBytes))).toFixed(2)],
+    displayAvgMB: +MB(avg(base.map(p => p.displayBytes))).toFixed(3),
+    thumbAvgMB: +MB(avg(base.map(p => p.thumbBytes))).toFixed(3),
+    correctedProxyAvgMB: +MB(avg(base.map(p => p.correctedProxyBytes))).toFixed(3),
+    displayWebpAvgMB: base.some(p => p.displayWebpBytes) ? +MB(avg(base.filter(p => p.displayWebpBytes).map(p => p.displayWebpBytes))).toFixed(3) : null,
+    makeCopiesAvgSec: +(avg(base.map(p => p.derivativesMs)) / 1000).toFixed(2),
+    originalsWithLocation: `${base.filter(p => p.originalHasLocation).length} of ${base.length}`,
+  };
+  report.measure('averages', m);
+  $('#avg').textContent = JSON.stringify(m, null, 2);
+  calc(m);
+}
+
+function calc(m) {
+  if (!m || m.originalAvgMB == null) return;
+  const pp = +$('#pPhotos').value, cp = +$('#copies').value, ccp = +$('#cPhotos').value;
+  const perPhoto = m.originalAvgMB + m.displayAvgMB + m.thumbAvgMB;
+  const perProductShared = pp * perPhoto + (m.correctedProxyAvgMB + m.thumbAvgMB);  // + 1 straightened box image
+  const perCopy = ccp * perPhoto;
+  const perModel = perProductShared + cp * perCopy;
+  const originalsShare = (pp * m.originalAvgMB + cp * ccp * m.originalAvgMB) / perModel;
+  const rows = [250, 500, 1000, 2000, 5000].map(n => `${String(n).padStart(5)} models → ${(n * perModel / 1024).toFixed(1)} GB  (originals ${(n * perModel * originalsShare / 1024).toFixed(1)} GB)`);
+  const out = {
+    inputs: { productPhotos: pp, copiesPerModel: cp, conditionPhotosPerCopy: ccp },
+    perModelMB: +perModel.toFixed(2), sharedProductPhotosMB: +perProductShared.toFixed(2), perExtraCopyMB: +perCopy.toFixed(2),
+    originalsSharePct: Math.round(originalsShare * 100),
+  };
+  report.measure('calculator', { ...out, totals: rows });
+  $('#calc').textContent = JSON.stringify(out, null, 2) + '\n\n' + rows.join('\n') +
+    `\n\nBackup: originals are the part to back up outside Google (${out.originalsSharePct}% of the space). Small copies can be re-made.`;
+}
+['#pPhotos', '#copies', '#cPhotos'].forEach(s => $(s).addEventListener('input', () => calc(report.data.measurements.averages)));
+
+// ---- Drive ----
+let folderId = localStorage.getItem('sgr0.spike7.folder');
+$('#signin').onclick = async () => {
+  try { await signIn(); report.log('Signed in'); $('#upload').disabled = $('#quota').disabled = $('#cleanup').disabled = false; }
+  catch (e) { alert(e.message); }
+};
+$('#upload').onclick = async () => {
+  if (!photos.length) { alert('Add photos first.'); return; }
+  $('#upload').disabled = true;
+  const res = [];
+  try {
+    if (folderId) { try { if ((await drive.get(folderId)).trashed) folderId = null; } catch { folderId = null; } }
+    if (!folderId) { folderId = (await drive.createFolder('SGR0_IMAGES')).id; localStorage.setItem('sgr0.spike7.folder', folderId); }
+    for (const p of photos.filter(p => !p.uploaded)) {
+      for (const [variant, blob] of [['original', p.file], ['display', p.display], ['thumb', p.thumb]]) {
+        $('#driveInfo').textContent = `Uploading #${p.n} ${variant}…`;
+        const md5 = variant === 'original' ? p.md5 : await md5Blob(blob);
+        const t0 = now();
+        const up = await drive.upload(blob, { name: `SGR0_img_${p.n}_${variant}.jpg`, parents: [folderId], mimeType: blob.type || 'image/jpeg',
+          appProperties: { sgr0Kind: 'img', sgr0Variant: variant } });
+        res.push({ n: p.n, variant, bytes: blob.size, ms: ms(t0), checksumOk: up.md5Checksum === md5 });
+      }
+      p.uploaded = true;
+    }
+    const allOk = res.every(r => r.checksumOk);
+    report.push('uploads', { at: new Date().toISOString(), files: res, allOk });
+    $('#driveInfo').textContent = `${res.length} files uploaded · ${allOk ? 'checksum OK for all' : 'CHECKSUM PROBLEM'}\n` +
+      res.map(r => `#${r.n} ${r.variant}: ${fmtBytes(r.bytes)} in ${(r.ms / 1000).toFixed(1)} s ${r.checksumOk ? '✓' : '✗'}`).join('\n');
+  } catch (e) { $('#driveInfo').textContent = `Upload failed: ${e.message}`; report.log(`Upload failed: ${e.message}`); }
+  $('#upload').disabled = false;
+};
+$('#quota').onclick = async () => {
+  try {
+    const q = (await drive.about()).storageQuota;
+    const r = { limitGB: q.limit ? +(q.limit / 1073741824).toFixed(1) : 'no limit reported', usageGB: +(q.usage / 1073741824).toFixed(2),
+      driveGB: q.usageInDrive ? +(q.usageInDrive / 1073741824).toFixed(2) : null, trashGB: q.usageInDriveTrash ? +(q.usageInDriveTrash / 1073741824).toFixed(2) : null,
+      freeGB: q.limit ? +((q.limit - q.usage) / 1073741824).toFixed(1) : null, readableWithDriveFileScope: true };
+    report.measure('quota', r);
+    $('#driveInfo').textContent = JSON.stringify(r, null, 2);
+  } catch (e) {
+    report.measure('quota', { readableWithDriveFileScope: false, error: e.message.slice(0, 200) });
+    $('#driveInfo').textContent = `Could not read storage: ${e.message}`;
+  }
+};
+$('#cleanup').onclick = async () => {
+  if (!folderId || !confirm('Move the SGR0_IMAGES test folder to Drive trash?')) return;
+  try { await drive.trash(folderId); report.log('SGR0_IMAGES moved to trash'); folderId = null; localStorage.removeItem('sgr0.spike7.folder'); $('#driveInfo').textContent = 'Test folder moved to trash.'; }
+  catch (e) { $('#driveInfo').textContent = `Clean-up failed: ${e.message}`; }
+};
+</script>
+</body>
+</html>
