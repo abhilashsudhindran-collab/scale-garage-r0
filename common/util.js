@@ -1,6 +1,7 @@
 // Shared helpers for the R0 spikes. No network calls, no secrets.
 
-export const KIT_VERSION = 'r0-1.0.0';
+export const KIT_VERSION = 'r0-1.0.0'; // unchanged so earlier results on the phone are kept
+export const KIT_BUILD = 'r0-1.1.0';   // this build: retest pages 4b, 6b, 7
 
 export const $ = (sel, root = document) => root.querySelector(sel);
 
