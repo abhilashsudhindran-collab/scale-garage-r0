@@ -25,6 +25,13 @@
   </div>
 
   <div class="card">
+    <h2>Retests (build r0-1.1)</h2>
+    <p><a class="btn" href="spikes/4-barcode/retest.html">4b · Barcode retest (6+ boxes)</a></p>
+    <p><a class="btn" href="spikes/6-offline/recovery.html">6b · Offline recovery (forced failures)</a></p>
+    <p><a class="btn" href="spikes/1-camera/photo-sizes.html">7 · Photo import &amp; real sizes</a></p>
+  </div>
+
+  <div class="card">
     <h2>When you are done</h2>
     <p><a class="btn secondary" href="results.html">Collect all results</a></p>
     <p class="muted">One button copies every spike's results so you can paste them back to Claude.</p>
@@ -36,9 +43,11 @@
   </div>
 </main>
 <script type="module">
-import { deviceInfo, registerServiceWorker, KIT_VERSION } from './common/util.js';
+import * as U from './common/util.js';
+const { deviceInfo, registerServiceWorker, KIT_VERSION } = U;
+const KIT_BUILD = U.KIT_BUILD ?? '(old copy cached — reopen this page)';
 registerServiceWorker();
-document.getElementById('dev').textContent = `Kit ${KIT_VERSION}\n` + JSON.stringify(deviceInfo(), null, 2);
+document.getElementById('dev').textContent = `Kit ${KIT_VERSION} · build ${KIT_BUILD}\n` + JSON.stringify(deviceInfo(), null, 2);
 </script>
 </body>
 </html>
