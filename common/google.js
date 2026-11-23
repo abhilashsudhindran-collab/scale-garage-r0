@@ -129,6 +129,9 @@ export const drive = {
     });
   },
 
+  // Storage quota of the signed-in account (tests whether drive.file scope can read it).
+  about: () => api(`${DRIVE}/about?fields=storageQuota`),
+
   download: async (id) => (await api(`${DRIVE}/files/${id}?alt=media`, { raw: true })).blob(),
 };
 
