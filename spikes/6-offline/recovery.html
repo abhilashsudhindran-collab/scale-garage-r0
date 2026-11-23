@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R0-6b Offline recovery retest</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icons/icon-192.png">
+<link rel="stylesheet" href="../../common/style.css">
+</head>
+<body>
+<main>
+  <a href="../../index.html">← All spikes</a>
+  <h1>Spike 6b — Offline recovery retest (forced failures)</h1>
+  <p class="muted">Retest of Spike 6. Instead of cutting the signal by hand, this page <strong>deliberately breaks a sync at an exact point</strong>, then checks that the next sync recovers <strong>without losing or duplicating anything</strong>. Uses the same Drive folder and Sheet as Spike 6.</p>
+  <div id="netBanner"></div>
+
+  <div class="card">
+    <h2>Status</h2>
+    <pre id="status">Checking…</pre>
+    <button id="persist" class="secondary">Ask Chrome to keep this data safe</button>
+  </div>
+
+  <div class="card">
+    <h2>0. Test conditions (recorded with the results)</h2>
+    <label for="condNet">Connection</label>
+    <select id="condNet"><option value="">— choose —</option><option>Wi-Fi</option><option>Mobile data 4G</option><option>Mobile data 5G</option><option>Other</option></select>
+    <label for="condNote">Anything else (place, battery saver, etc.)</label>
+    <input id="condNote" type="text" placeholder="e.g. home Wi-Fi, battery saver off">
+    <button id="saveCond" class="secondary">Save conditions</button>
+    <pre id="condInfo">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>Forced failure for the NEXT sync</h2>
+    <p class="muted">The failure happens once, on the first item, then switches itself off.</p>
+    <select id="fault">
+      <option value="none">None (normal sync)</option>
+      <option value="after-upload">F1 · Fail after the photo upload, before the Sheet row</option>
+      <option value="after-row">F2 · Fail after the Sheet row, before the phone marks it synced</option>
+    </select>
+    <div class="row">
+      <button id="addTest" class="secondary">Add a test item (no camera needed)</button>
+    </div>
+    <div class="row">
+      <button id="f3" disabled>F3 · Run 5 instant-retry cycles</button>
+    </div>
+    <p class="muted">F3 adds 5 test items one by one. For each: sync with F1 failure, then re-sync <strong>immediately</strong> (no pause). Tests whether Drive finds the half-finished upload straight away.</p>
+    <pre id="faultInfo">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>1. Capture (optional — real photos)</h2>
+    <label for="code">Product code</label>
+    <input id="code" type="text" placeholder="e.g. 00567" autocapitalize="characters">
+    <label for="note">Note</label>
+    <input id="note" type="text" placeholder="e.g. Bought at swap meet">
+    <div class="row">
+      <button id="capCam">Take photo &amp; queue</button>
+      <button id="capGal" class="secondary">Choose photo &amp; queue</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. Queue on this phone</h2>
+    <div id="queue">Empty.</div>
+  </div>
+
+  <div class="card">
+    <h2>3. Sync (needs signal)</h2>
+    <p class="muted">Uses the same Client ID you saved in Spike 2.</p>
+    <div class="row">
+      <button id="signin">Sign in</button>
+      <button id="sync" disabled>Sync now</button>
+      <button id="audit" class="secondary" disabled>Check for duplicates</button>
+    </div>
+    <label><input id="autoSync" type="checkbox" checked> Sync automatically when signal returns</label>
+    <pre id="syncInfo">—</pre>
+    <button id="clearSynced" class="secondary">Remove synced items from phone</button>
+  </div>
+
+  <div class="card" id="panel"></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script type="module">
+import { $, el, now, ms, uuid, fmtBytes, pickFile, registerServiceWorker } from '../../common/util.js';
+import { Report } from '../../common/report.js';
+import { queue } from '../../common/idb.js';
+import { signIn, hasToken, tokenInfo, getClientId, drive, sheets } from '../../common/google.js';
+import { md5Blob } from '../../common/md5.js';
+
+registerServiceWorker();
+const report = new Report('spike-6b-recovery', 'Offline recovery retest (forced failures)', [
+  { id: 'f1', label: 'F1 · Recovery after "fail after upload"', how: 'Choose F1, add a test item, Sync now (it fails), then Sync now again. Expect reusedExistingUpload ≥ 1 and the item synced.' },
+  { id: 'f2', label: 'F2 · Recovery after "fail after row"', how: 'Choose F2, add a test item, Sync now (it fails), then Sync now again. Expect skippedExistingRow ≥ 1 and the item synced.' },
+  { id: 'f3', label: 'F3 · Instant retries create no duplicates', how: 'Tap F3. Expect 5 cycles done, then Check for duplicates shows 0 duplicates.' },
+  { id: 'f4', label: 'F4 · Sync after the sign-in expired', how: 'Add a test item, leave the page open but idle for over 60 minutes, then Sync now. Expect a quiet re-sign-in or a sign-in prompt, and the item synced.' },
+  { id: 'final', label: 'Final check: no duplicates, nothing missing', how: 'Check for duplicates: duplicateFileGroups 0, duplicateRowGroups 0, syncedButMissing 0.' },
+]);
+report.renderPanel($('#panel'));
+
+const ST = JSON.parse(localStorage.getItem('sgr0.spike6.state') || '{}');
+const saveST = () => localStorage.setItem('sgr0.spike6.state', JSON.stringify(ST));
+
+function netBanner() {
+  $('#netBanner').innerHTML = navigator.onLine ? '' : '<div class="banner">No connection — capture still works; items wait on the phone.</div>';
+}
+addEventListener('online', () => { netBanner(); report.log('Connection back'); if (!$('#autoSync').checked) return; if (hasToken()) syncAll('auto-online'); else report.log('Auto-sync skipped: sign-in expired — tap Sync now'); });
+addEventListener('offline', () => { netBanner(); report.log('Connection lost'); });
+netBanner();
+
+async function refreshStatus() {
+  const items = await queue.all();
+  const est = navigator.storage?.estimate ? await navigator.storage.estimate() : null;
+  const persisted = navigator.storage?.persisted ? await navigator.storage.persisted() : null;
+  const s = {
+    online: navigator.onLine,
+    serviceWorkerControlling: !!navigator.serviceWorker?.controller,
+    storagePersisted: persisted,
+    storageUsed: est ? fmtBytes(est.usage) : null,
+    storageQuota: est ? fmtBytes(est.quota) : null,
+    queued: items.length,
+    pending: items.filter(i => i.status !== 'synced').length,
+    synced: items.filter(i => i.status === 'synced').length,
+    oldestItem: items.length ? items.map(i => i.createdAt).sort()[0] : null,
+    clientIdSaved: !!getClientId(),
+    signedIn: hasToken(),
+    tokenExpiresInMin: tokenInfo() ? Math.round(tokenInfo().expiresInSec / 60) : null,
+  };
+  $('#status').textContent = JSON.stringify(s, null, 2);
+  report.measure('lastStatus', { ...s, at: new Date().toISOString() });
+  renderQueue(items);
+  return s;
+}
+
+function renderQueue(items) {
+  if (!items.length) { $('#queue').textContent = 'Empty.'; return; }
+  const t = el('table', {}, el('tr', {}, ...['When', 'Code', 'Photo', 'Status'].map(h => el('th', {}, h))));
+  items.sort((a, b) => a.createdAt.localeCompare(b.createdAt)).forEach(i => t.append(el('tr', {},
+    el('td', {}, i.createdAt.slice(5, 16).replace('T', ' ')), el('td', {}, i.productCode || '—'),
+    el('td', {}, fmtBytes(i.photoBytes)),
+    el('td', { class: i.status === 'synced' ? 'ok' : i.status.startsWith('error') ? 'bad' : 'warn' }, i.status + (i.attempts ? ` (${i.attempts} tries)` : '')))));
+  $('#queue').innerHTML = ''; $('#queue').append(t);
+}
+
+$('#persist').onclick = async () => {
+  const r = navigator.storage?.persist ? await navigator.storage.persist() : null;
+  report.measure('persistRequest', r); report.log(`Persistent storage granted: ${r}`);
+  refreshStatus();
+};
+
+async function queueBlob(file, productCode, note, kind) {
+  const t0 = now();
+  const item = {
+    clientId: uuid(), createdAt: new Date().toISOString(), createdOnline: navigator.onLine,
+    productCode, note, kind,
+    photo: file, photoType: file.type || 'image/jpeg', photoBytes: file.size,
+    md5: await md5Blob(file),
+    status: 'pending', attempts: 0, driveFileId: null, rowWritten: false, lastError: null,
+  };
+  await queue.put(item);
+  const back = await queue.get(item.clientId);
+  const ok = back && back.photo && (await md5Blob(back.photo)) === item.md5;
+  report.push('captures', { kind, online: item.createdOnline, bytes: item.photoBytes, storeMs: ms(t0), readBackIntact: ok });
+  report.log(`Queued ${item.clientId.slice(0, 8)} ${productCode} (${fmtBytes(item.photoBytes)}) intact=${ok}`);
+  refreshStatus();
+  return item;
+}
+
+async function capture(captureMode) {
+  const [file] = await pickFile({ capture: captureMode });
+  if (!file) return;
+  await queueBlob(file, $('#code').value, $('#note').value, 'photo');
+  $('#note').value = '';
+}
+
+// A unique test image made on the phone (random pattern), so no camera is needed.
+let testNo = 0;
+async function makeTestImage() {
+  const c = document.createElement('canvas'); c.width = 800; c.height = 600;
+  const g = c.getContext('2d');
+  for (let i = 0; i < 400; i++) { g.fillStyle = `hsl(${Math.random() * 360},70%,50%)`; g.fillRect(Math.random() * 800, Math.random() * 600, 40, 40); }
+  g.fillStyle = '#000'; g.font = 'bold 48px sans-serif'; g.fillText(`TEST ${new Date().toISOString().slice(11, 19)}`, 40, 320);
+  return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9));
+}
+async function addTestItem() {
+  testNo++;
+  return queueBlob(await makeTestImage(), `RTEST${String(testNo).padStart(2, '0')}`, 'forced-failure test item', 'test');
+}
+$('#addTest').onclick = addTestItem;
+
+$('#saveCond').onclick = () => {
+  const c = { connection: $('#condNet').value, note: $('#condNote').value, effectiveType: navigator.connection?.effectiveType ?? null,
+    downlinkMbps: navigator.connection?.downlink ?? null, at: new Date().toISOString() };
+  report.push('conditions', c); $('#condInfo').textContent = JSON.stringify(c, null, 2);
+};
+
+$('#capCam').onclick = () => capture(true);
+$('#capGal').onclick = () => capture(false);
+
+$('#signin').onclick = async () => {
+  try { await signIn(); report.log('Signed in'); $('#sync').disabled = $('#audit').disabled = $('#f3').disabled = false; }
+  catch (e) { alert(e.message); report.log(`Sign-in failed: ${e.message}`); }
+};
+
+async function ensureTargets() {
+  if (ST.folderId) { try { const f = await drive.get(ST.folderId); if (f.trashed) ST.folderId = null; } catch { ST.folderId = null; } }
+  if (!ST.folderId) { ST.folderId = (await drive.createFolder('SGR0_OFFLINE')).id; saveST(); }
+  if (ST.sheetId) { try { const f = await drive.get(ST.sheetId); if (f.trashed) ST.sheetId = null; } catch { ST.sheetId = null; } }
+  if (!ST.sheetId) {
+    const ss = await sheets.create('SGR0_OFFLINE_SHEET', ['QUEUE']);
+    const meta = await drive.get(ss.spreadsheetId, 'id,parents');
+    await drive.move(ss.spreadsheetId, ST.folderId, (meta.parents || []).join(','));
+    await sheets.write(ss.spreadsheetId, 'QUEUE!A1', [['client_id', 'created_at', 'product_code', 'note', 'drive_file_id', 'synced_at']]);
+    ST.sheetId = ss.spreadsheetId; saveST();
+  }
+}
+
+let syncing = false;
+async function syncAll(trigger) {
+  if (syncing) return;
+  syncing = true;
+  const t0 = now();
+  const fault = $('#fault').value;
+  let faultUsed = false;
+  const summary = { trigger, fault, attempted: 0, synced: 0, failed: 0, integrityErrors: 0, reusedExistingUpload: 0, skippedExistingRow: 0 };
+  $('#syncInfo').textContent = 'Syncing…';
+  try {
+    await ensureTargets();
+    const items = (await queue.all()).filter(i => i.status !== 'synced');
+    let existingIds = null;
+    for (const item of items) {
+      summary.attempted++;
+      item.attempts++; item.status = 'syncing'; await queue.put(item);
+      try {
+        // 1. Photo — idempotent: look for an earlier upload of this same item first.
+        if (!item.driveFileId) {
+          const found = await drive.list(`appProperties has { key='sgr0ClientId' and value='${item.clientId}' } and trashed=false`);
+          if (found.files.length) { item.driveFileId = found.files[0].id; summary.reusedExistingUpload++; }
+          else {
+            const up = await drive.upload(item.photo, { name: `SGR0_off_${item.clientId}.jpg`, parents: [ST.folderId],
+              mimeType: item.photoType, appProperties: { sgr0ClientId: item.clientId, sgr0Kind: 'offline' } });
+            // F1: pretend the reply was lost — the upload happened, but the phone never records its ID.
+            if (fault === 'after-upload' && !faultUsed) { faultUsed = true; throw new Error('INJECTED F1: failed after upload (upload done, reply "lost")'); }
+            item.driveFileId = up.id;
+          }
+          await queue.put(item);
+        }
+        const meta = await drive.get(item.driveFileId, 'id,md5Checksum,size');
+        if (meta.md5Checksum !== item.md5) {
+          item.status = 'error-integrity'; item.lastError = `checksum mismatch (drive ${meta.md5Checksum})`;
+          summary.integrityErrors++; await queue.put(item); continue;
+        }
+        // 2. Sheet row — idempotent: skip if this client_id is already in column A.
+        if (!item.rowWritten) {
+          if (!existingIds) existingIds = new Set(((await sheets.read(ST.sheetId, 'QUEUE!A:A')).values || []).flat());
+          if (existingIds.has(item.clientId)) summary.skippedExistingRow++;
+          else {
+            await sheets.append(ST.sheetId, 'QUEUE!A1', [[item.clientId, item.createdAt, item.productCode, item.note, item.driveFileId, new Date().toISOString()]]);
+            // F2: the row is written, but the phone "crashes" before remembering that.
+            if (fault === 'after-row' && !faultUsed) { faultUsed = true; throw new Error('INJECTED F2: failed after row (row written, not recorded)'); }
+            existingIds.add(item.clientId);
+          }
+          item.rowWritten = true;
+        }
+        item.status = 'synced'; item.lastError = null; summary.synced++;
+      } catch (e) {
+        item.status = 'pending'; item.lastError = e.message; summary.failed++;
+        report.log(`Item ${item.clientId.slice(0, 8)} failed: ${e.message.slice(0, 120)}`);
+      }
+      await queue.put(item);
+    }
+  } catch (e) {
+    summary.fatal = e.message;
+  } finally {
+    summary.ms = ms(t0);
+    summary.faultFired = faultUsed;
+    if (faultUsed) { $('#fault').value = 'none'; $('#faultInfo').textContent = `Forced failure "${fault}" fired once and is now switched off. Tap Sync now again to recover.`; }
+    syncing = false;
+    report.push('syncRuns', summary);
+    report.log('Sync finished', summary);
+    $('#syncInfo').textContent = JSON.stringify(summary, null, 2);
+    refreshStatus();
+  }
+}
+async function ensureSignedIn(why) {
+  if (hasToken()) return true;
+  const t0 = now();
+  try { await signIn(); report.push('reauth', { why, ok: true, ms: ms(t0), at: new Date().toISOString() }); report.log(`Signed in again (${why}) in ${ms(t0)} ms`); return true; }
+  catch (e) { report.push('reauth', { why, ok: false, error: e.message, at: new Date().toISOString() }); report.log(`Re-sign-in failed: ${e.message}`); return false; }
+}
+$('#sync').onclick = async () => {
+  const hadToken = hasToken();
+  if (!(await ensureSignedIn('sync tapped, sign-in had expired'))) { $('#syncInfo').textContent = 'Sign-in needed — tap Sign in.'; return; }
+  report.log(`Sync tapped (sign-in was ${hadToken ? 'still valid' : 'expired, renewed'})`);
+  await syncAll(hadToken ? 'manual' : 'manual-after-reauth');
+};
+
+$('#f3').onclick = async () => {
+  $('#f3').disabled = true;
+  const cycles = [];
+  for (let i = 1; i <= 5; i++) {
+    $('#faultInfo').textContent = `F3 cycle ${i} of 5…`;
+    await addTestItem();
+    $('#fault').value = 'after-upload';
+    await syncAll(`F3-cycle-${i}-fail`);
+    await syncAll(`F3-cycle-${i}-instant-retry`);   // no pause on purpose
+    const last = report.data.measurements.syncRuns.slice(-1)[0];
+    cycles.push({ cycle: i, reused: last.reusedExistingUpload, synced: last.synced, failed: last.failed });
+  }
+  report.push('f3Runs', { at: new Date().toISOString(), cycles });
+  $('#faultInfo').textContent = `F3 done. ${cycles.filter(c => c.reused >= 1).length} of 5 retries found the earlier upload.\nNow tap "Check for duplicates".\n` + JSON.stringify(cycles, null, 1);
+  $('#f3').disabled = false;
+};
+
+$('#audit').onclick = async () => {
+  try {
+    await ensureTargets();
+    const files = (await drive.list(`appProperties has { key='sgr0Kind' and value='offline' } and trashed=false`,
+      'files(id,appProperties)')).files;
+    const counts = {};
+    files.forEach(f => { const k = f.appProperties?.sgr0ClientId; counts[k] = (counts[k] || 0) + 1; });
+    const dupFiles = Object.values(counts).filter(n => n > 1).length;
+    const rows = ((await sheets.read(ST.sheetId, 'QUEUE!A2:A')).values || []).flat();
+    const rowCounts = {};
+    rows.forEach(r => { rowCounts[r] = (rowCounts[r] || 0) + 1; });
+    const dupRows = Object.values(rowCounts).filter(n => n > 1).length;
+    const local = await queue.all();
+    const missing = local.filter(i => i.status === 'synced' && (!counts[i.clientId] || !rowCounts[i.clientId])).length;
+    const r = { driveFiles: files.length, sheetRows: rows.length, duplicateFileGroups: dupFiles, duplicateRowGroups: dupRows, syncedButMissing: missing };
+    $('#syncInfo').textContent = JSON.stringify(r, null, 2) + (dupFiles || dupRows || missing ? '\n\n✗ Integrity problem' : '\n\n✓ No duplicates, nothing missing');
+    report.push('audits', r); report.log('Audit', r);
+  } catch (e) { $('#syncInfo').textContent = `Audit failed: ${e.message}`; }
+};
+
+$('#clearSynced').onclick = async () => {
+  const items = (await queue.all()).filter(i => i.status === 'synced');
+  if (!items.length || !confirm(`Remove ${items.length} synced item(s) from this phone? Copies stay in Drive.`)) return;
+  for (const i of items) await queue.remove(i.clientId);
+  report.log(`Removed ${items.length} synced items from phone`);
+  refreshStatus();
+};
+
+refreshStatus();
+</script>
+</body>
+</html>
